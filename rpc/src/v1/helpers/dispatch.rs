@@ -30,19 +30,20 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use stats::Corpus;
 
+use crypto::DEFAULT_MAC;
+use ethcore::account_provider::AccountProvider;
+use ethcore::client::BlockChainClient;
+use ethcore::ids::BlockId;
+use ethcore::miner::{self, MinerService};
 use ethkey::{Password, Signature};
 use sync::LightSync;
-use ethcore::ids::BlockId;
-use ethcore::client::BlockChainClient;
-use ethcore::miner::{self, MinerService};
-use ethcore::account_provider::AccountProvider;
-use crypto::DEFAULT_MAC;
-use transaction::{Action, SignedTransaction, PendingTransaction, Transaction};
+use transaction::{Action, SignedTransaction, PendingTransaction, Transaction, Error as TransactionError};
 
 use jsonrpc_core::{BoxFuture, Result, Error};
 use jsonrpc_core::futures::{future, Future, Poll, Async};
 use jsonrpc_core::futures::future::Either;
 use v1::helpers::{errors, nonce, TransactionRequest, FilledTransactionRequest, ConfirmationPayload};
+use v1::helpers::light_fetch::LightFetch;
 use v1::types::{
 	H256 as RpcH256, H520 as RpcH520, Bytes as RpcBytes,
 	RichRawTransaction as RpcRichRawTransaction,
@@ -325,6 +326,43 @@ impl LightDispatcher {
 			None => Box::new(future::err(errors::network_disabled()))
 		}
 	}
+
+	// Light client version of the `verify_transaction`
+	//
+	// This is performed before adding the transaction to the transaction queue which the `full node` doesn´t
+	// Mainly, vecause limited amount data is cached excluding the actual account balances which means that
+	// network requests have to performed to fetch `account balances` for example!
+	fn verify_transaction(&self, tx: &PendingTransaction) -> Result<()> {
+		// TODO: Fetch `min_gas price` from the network and check that the transaction is bigger or
+		// equal to it!
+		//
+		// Should we deny transactions with gas price set to zero?
+
+		let address = tx.transaction.sender();
+		let tx_cost = tx.transaction.value + tx.transaction.gas_price * tx.transaction.gas;
+
+		let l = LightFetch {
+			client: self.client.clone(),
+			on_demand: self.on_demand.clone(),
+			sync: self.sync.clone(),
+			cache: self.cache.clone(),
+			gas_price_percentile: self.gas_price_percentile,
+		};
+
+		// Try to fetch `account balance` from the network
+		l.account(address, BlockId::Latest)
+			.wait()
+			.and_then(|a| match a {
+					Some(ref acc) if tx_cost > acc.balance => {
+						Err(errors::transaction(TransactionError::InsufficientBalance {
+							balance: acc.balance,
+							cost: tx_cost,
+						}))
+					}
+					Some(_) => Ok(()),
+					_ => Err(errors::account("Account was not found", address)),
+			})
+	}
 }
 
 impl Dispatcher for LightDispatcher {
@@ -408,9 +446,10 @@ impl Dispatcher for LightDispatcher {
 	}
 
 	fn dispatch_transaction(&self, signed_transaction: PendingTransaction) -> Result<H256> {
+		self.verify_transaction(&signed_transaction)?;
 		let hash = signed_transaction.transaction.hash();
 
-		self.transaction_queue.write().import(signed_transaction)
+			self.transaction_queue.write().import(signed_transaction)
 			.map_err(errors::transaction)
 			.map(|_| hash)
 	}
